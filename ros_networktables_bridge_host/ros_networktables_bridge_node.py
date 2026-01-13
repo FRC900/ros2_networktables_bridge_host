@@ -1,14 +1,20 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import sys
+import time
 from typing import Any, Dict, Optional, Set
-import rospy
+from threading import Lock
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
+
 from networktables import (
     NetworkTables,
     NetworkTable,
     NetworkTablesInstance,
     NetworkTableEntry,
 )
-from threading import Lock
+
 from ros_conversions import (
     ros_msg_to_string_json,
     string_json_to_ros_msg,
@@ -20,41 +26,50 @@ from generic_message_subscriber import GenericMessageSubscriber
 NotifyFlags = NetworkTablesInstance.NotifyFlags
 
 
-class ROSNetworkTablesBridge:
+class ROSNetworkTablesBridge(Node):
     """
     This class is a bridge between ROS (Robot Operating System) and NetworkTables,
     allowing messages from ROS topics to be forwarded to NetworkTables and vice versa.
     The bridge can operate as either a NetworkTables server or a client,
     connecting to a remote server.
     """
-
+    
     def __init__(self):
-        # Initialize the ROS node
-        rospy.init_node("ros_networktables_bridge")
+        super().__init__("ros_networktables_bridge")
 
-        # Get the ROS parameters
-        self.is_server = bool(rospy.get_param("~is_server", False))
-        self.address = str(rospy.get_param("~address", "")).strip()
-        self.port = int(rospy.get_param("~port", 1735))
-        self.update_interval = float(rospy.get_param("~update_interval", 0.02))
-        self.queue_size = int(rospy.get_param("~queue_size", 10))
-        self.nt_warmup_time = float(rospy.get_param("~nt_warmup_time", 2.0))
-        self.publish_warmup_time = rospy.Duration(
-            rospy.get_param("~publish_warmup_time", 2.0)
-        )
-        self.publisher_non_empty_timeout = rospy.Duration(
-            rospy.get_param("~publisher_non_empty_timeout", 0.25)
-        )
-        self.no_data_timeout = rospy.Duration(rospy.get_param("~no_data_timeout", 2.0))
-        self.ros_to_nt_key = str(rospy.get_param("~ros_to_nt_table_key", "ros_to_nt"))
-        self.nt_to_ros_key = str(rospy.get_param("~nt_to_ros_table_key", "nt_to_ros"))
-        self.topics_request_key = str(rospy.get_param("~topics_request_key", "@topics"))
-        self.time_sync_key = str(rospy.get_param("~time_sync_key", "@time"))
+        # Declare params
+        self.declare_parameter('is_server', False)
+        self.declare_parameter('address', '')
+        self.declare_parameter('port', 1735)
+        self.declare_parameter('update_interval', 0.02)
+        self.declare_parameter('queue_size', 10)
+        self.declare_parameter('nt_warmup_time', 2.0)
+        self.declare_parameter('publish_warmup_time', 2.0)
+        self.declare_parameter('publisher_non_empty_timeout', 0.25)
+        self.declare_parameter('no_data_timeout', 2.0)
+        self.declare_parameter('ros_to_nt_table_key', 'ros_to_nt')
+        self.declare_parameter('nt_to_ros_table_key', 'nt_to_ros')
+        self.declare_parameter('topics_request_key', '@topics')
+        self.declare_parameter('time_sync_key', '@time')
+
+        self.is_server = self.get_parameter('is_server').value
+        self.address = str(self.get_parameter('address').value).strip()
+        self.port = int(self.get_parameter('port').value)
+        self.update_interval = float(self.get_parameter('update_interval').value)
+        self.queue_size = int(self.get_parameter('queue_size').value)
+        self.nt_warmup_time = float(self.get_parameter('nt_warmup_time').value)
+        self.publish_warmup_time = float(self.get_parameter('publish_warmup_time').value)
+        self.publisher_non_empty_timeout = float(self.get_parameter('publisher_non_empty_timeout').value)
+        self.no_data_timeout = float(self.get_parameter('no_data_timeout').value)
+        self.ros_to_nt_key = str(self.get_parameter('ros_to_nt_table_key').value)
+        self.nt_to_ros_key = str(self.get_parameter('nt_to_ros_table_key').value)
+        self.topics_request_key = str(self.get_parameter('topics_request_key').value)
+        self.time_sync_key = str(self.get_parameter('time_sync_key').value)
 
         self.open()
 
         # Initialize dictionaries and sets for publishers, subscribers, and keys
-        self.publishers: Dict[str, rospy.Publisher] = {}
+        self.nt_publishers: Dict[str, Any] = {}
         self.pub_listen_keys: Set[str] = set()
         self.pub_listen_handles: Dict[str, int] = {}
         self.pub_initial_values: Optional[Dict[str, Any]] = {}
@@ -63,44 +78,41 @@ class ROSNetworkTablesBridge:
         self.subscribers: Dict[str, GenericMessageSubscriber] = {}
         self.sub_listen_keys: Set[str] = set()
 
-        # Get the ROS namespace
-        self.namespace: str = rospy.get_namespace()
+        # ROS namespace
+        self.namespace: str = self.get_namespace()
 
-        # start time of node
-        self.start_time = rospy.Time(0)
+        # start time of node (seconds)
+        self.start_time = self.now()
 
-        rospy.loginfo(f"Bridge namespace: {self.namespace}")
-        rospy.loginfo("ros_networktables_bridge is ready.")
+        self.no_entries_timer = self.now()
+
+        self.get_logger().info(f"Bridge namespace: {self.namespace}")
+        self.get_logger().info("ros_networktables_bridge is ready.")
+
+        self._timer = None # created in run
+
+    def now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def open(self):
         # Start NetworkTables server or client based on the is_server parameter
         if self.is_server:
             NetworkTables.startServer(listenAddress=self.address, port=self.port)
-            rospy.loginfo(f"Starting server on port {self.port}")
+            self.get_logger().info(f"Starting server on port {self.port}")
             if len(self.address) > 0:
-                rospy.loginfo(f"Address is {self.address}")
+                self.get_logger().info(f"Address is {self.address}")
             assert NetworkTables.isServer()
         else:
             NetworkTables.startClient((self.address, self.port))
-            rospy.loginfo(f"Connecting to {self.address}:{self.port}")
+            self.get_logger().info(f"Connecting to {self.address}:{self.port}")
         NetworkTables.setUpdateRate(self.update_interval)
 
         # Get NetworkTables subtables
-        self.ros_to_nt_subtable: NetworkTable = NetworkTables.getTable(
-            self.ros_to_nt_key
-        )
-        self.nt_to_ros_subtable: NetworkTable = NetworkTables.getTable(
-            self.nt_to_ros_key
-        )
-        self.ros_to_nt_topic_requests_table: NetworkTable = (
-            self.ros_to_nt_subtable.getSubTable(self.topics_request_key)
-        )
-        self.nt_to_ros_topic_requests_table: NetworkTable = (
-            self.nt_to_ros_subtable.getSubTable(self.topics_request_key)
-        )
-        self.time_sync_entry: NetworkTableEntry = self.ros_to_nt_subtable.getEntry(
-            self.time_sync_key
-        )
+        self.ros_to_nt_subtable: NetworkTable = NetworkTables.getTable(self.ros_to_nt_key)
+        self.nt_to_ros_subtable: NetworkTable = NetworkTables.getTable(self.nt_to_ros_key)
+        self.ros_to_nt_topic_requests_table: NetworkTable = self.ros_to_nt_subtable.getSubTable(self.topics_request_key)
+        self.nt_to_ros_topic_requests_table: NetworkTable = self.nt_to_ros_subtable.getSubTable(self.topics_request_key)
+        self.time_sync_entry: NetworkTableEntry = self.ros_to_nt_subtable.getEntry(self.time_sync_key)
 
     def close(self):
         # Shutdown NetworkTables connection
@@ -112,15 +124,15 @@ class ROSNetworkTablesBridge:
     def reopen(self):
         # Close and open NetworkTables connection
         self.close()
-        rospy.sleep(0.25)
+        time.sleep(0.25)
         self.open()
-        rospy.sleep(self.nt_warmup_time)
+        time.sleep(self.nt_warmup_time)
 
     def update_time_sync(self):
         # Update time sync entry with current local time
-        self.time_sync_entry.setDouble(rospy.Time.now().to_sec())
+        self.time_sync_entry.setDouble(self.now())
 
-    def has_entries(self):
+    def has_entries(self) -> bool:
         # Are there any entries or subtables in the ROS <-> NT tables
         num_keys = (
             len(self.ros_to_nt_subtable.getKeys())
@@ -146,15 +158,11 @@ class ROSNetworkTablesBridge:
             self.unregister_subscriber(nt_key)
 
         # create GenericMessageSubscriber with a callback to ros_to_nt_callback
-        subscriber = GenericMessageSubscriber(
-            topic_name,
-            lambda msg: self.ros_to_nt_callback(msg, nt_key),
-            queue_size=self.queue_size,
-        )
+        subscriber = GenericMessageSubscriber(self, topic_name, lambda msg: self.ros_to_nt_callback(msg, nt_key), queue_size=self.queue_size)
 
         # add to dictionary of subscribers
         self.subscribers[nt_key] = subscriber
-        rospy.loginfo(f"Registering new subscriber: {topic_name} -> {nt_key}")
+        self.get_logger().info(f"Registering new subscriber: {topic_name} -> {nt_key}")
 
     def ros_to_nt_callback(self, msg, nt_key: str):
         """
@@ -165,13 +173,11 @@ class ROSNetworkTablesBridge:
         try:
             # convert ROS message to JSON string
             raw_msg = ros_msg_to_string_json(msg)
-
+            
             # send JSON string to corresponding NT entry
             self.ros_to_nt_subtable.getEntry(nt_key).setString(raw_msg)
-        except BaseException as e:
-            rospy.logerr_throttle(
-                1.0, f"Exception in ros_to_nt_callback: {e}", exc_info=e
-            )
+        except Exception as e:
+            self.get_logger().error(f"Exception in ros_to_nt_callback: {e}")
 
     def create_nt_to_ros_publisher(self, nt_key: str, ros_msg_type) -> None:
         """
@@ -183,17 +189,17 @@ class ROSNetworkTablesBridge:
         assert len(topic_name) > 0
 
         # Check if publisher has already been created
-        if nt_key in self.publishers:
+        if nt_key in self.nt_publishers:
             self.unregister_publisher(nt_key)
 
         # create ROS publisher using message type received from NT
-        pub = rospy.Publisher(
-            topic_name, ros_msg_type, queue_size=self.queue_size, latch=True
-        )
+        qos = QoSProfile(depth=self.queue_size)
+        qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
 
         # add to dictionary of publishers
-        self.publishers[nt_key] = pub
-        rospy.loginfo(f"Registering new publisher: {nt_key} -> {topic_name}")
+        pub = self.create_publisher(ros_msg_type, topic_name, qos)
+        self.nt_publishers[nt_key] = pub
+        self.get_logger().info(f"Registering new publisher: {nt_key} -> {topic_name}")
 
     def get_key_base_name(self, key: str) -> str:
         # remove prefix from the key
@@ -202,18 +208,15 @@ class ROSNetworkTablesBridge:
 
     def absolute_topic_from_nt_key(self, key: str) -> str:
         topic_key = self.get_key_base_name(key)
-
+        
         # convert to ROS topic
         topic_name = parse_nt_topic(topic_key)
-
+        
         # convert to absolute topic
         topic_name = self.get_absolute_topic(topic_name)
-
         return topic_name
 
-    def nt_to_ros_callback(
-        self, entry: NetworkTableEntry, key: str, value: str, isNew: int
-    ):
+    def nt_to_ros_callback(self, entry: NetworkTableEntry, key: str, value: str, isNew: int):
         """
         Callback function for forwarding NetworkTables messages to ROS.
         :param entry: NetworkTableEntry object.
@@ -224,15 +227,8 @@ class ROSNetworkTablesBridge:
         try:
             with self.pub_lock:
                 self.publish_ros_message_from_nt_string(key, value)
-        except rospy.exceptions.ROSException as e:
-            rospy.logerr(e)
-        except BaseException as e:
-            # for some reason, exceptions only get printed within NT callbacks
-            # if they are logged like this.
-            rospy.logerr(
-                f"Exception in nt_to_ros_callback: {e}. Received value: {value}",
-                exc_info=e,
-            )
+        except Exception as e:
+            self.get_logger().error(f"Exception in nt_to_ros_callback: {e}")
 
     def publish_ros_message_from_nt_string(self, key: str, value: str) -> None:
         key = self.get_key_base_name(key)
@@ -241,43 +237,39 @@ class ROSNetworkTablesBridge:
         # convert JSON string to ROS message and type
         ros_msg, ros_msg_type = string_json_to_ros_msg(value)
         if ros_msg is None or ros_msg_type is None:
-            rospy.logwarn(f"Failed to parse message from {key}: {value}")
+            self.get_logger().warn(f"Failed to parse message from {key}: {value}")
             return
-
+        
         # create the publisher if that hasn't been done yet
-        if key not in self.publishers:
+        if key not in self.nt_publishers:
             self.create_nt_to_ros_publisher(key, ros_msg_type)
-
+            
         # get the corresponding publisher to the topic name
-        pub = self.publishers[key]
+        pub = self.nt_publishers[key]
 
-        if pub.impl is not None and pub.impl.closed:
-            rospy.logdebug(f"Publisher for {key} has closed. Skipping message publish.")
-            return
-
-        if self.pub_initial_values is None:
-            # If initial values is None, the warmup time has exceeded.
-            # Publish all new values
-            pub.publish(ros_msg)
-        else:
-            if key in self.pub_initial_values:
-                # If the we're still in warmup time, if an initial value has been registered
-                # already, that means the value was updated during warmup. Publish this
-                # new value
+        try:
+            if self.pub_initial_values is None:
+                # If initial values is None, the warmup time has exceeded.
+                # Publish all new values
                 pub.publish(ros_msg)
             else:
-                # Otherwise, it's possible this value is stale, so don't publish it.
-                self.pub_initial_values[key] = ros_msg
-                rospy.logdebug(f"Initial value {key}: {ros_msg}")
+                if key in self.pub_initial_values:
+                    # If the we're still in warmup time, if an initial value has been registered
+                    # already, that means the value was updated during warmup. Publish this
+                    # new value
+                    pub.publish(ros_msg)
+                else:
+                    # Otherwise, it's possible this value is stale, so don't publish it.
+                    self.pub_initial_values[key] = ros_msg
+                    self.get_logger().debug(f"Initial value {key}: {ros_msg}")
 
-        # remove initial values if start up time is exceeded.
-        # This is done to save memory in case the initial value is large
-        if (
-            self.pub_initial_values is not None
-            and rospy.Time.now() - self.start_time > self.publish_warmup_time
-        ):
-            rospy.logdebug("Publish warmup complete")
-            self.pub_initial_values = None
+            # remove initial values if start up time is exceeded.
+            # This is done to save memory in case the initial value is large
+            if self.pub_initial_values is not None and self.now() - self.start_time > self.publish_warmup_time:
+                self.get_logger().debug("Publish warmup complete")
+                self.pub_initial_values = None
+        except Exception as e:
+            self.get_logger().error(f"Exception publishing message: {e}")
 
     def unregister_publisher(self, nt_key: str) -> None:
         """
@@ -285,12 +277,16 @@ class ROSNetworkTablesBridge:
 
         :param nt_key: NetworkTables entry key that points to a publisher
         """
-        rospy.loginfo(f"Unregistering publish topic {nt_key}")
-        if nt_key not in self.publishers:
-            rospy.logwarn(f"Can't remove publisher {nt_key} as it's already removed.")
+        self.get_logger().info(f"Unregistering publish topic {nt_key}")
+        if nt_key not in self.nt_publishers:
+            self.get_logger().warn(f"Can't remove publisher {nt_key} as it's already removed.")
             return
-        self.publishers[nt_key].unregister()
-        del self.publishers[nt_key]
+        pub = self.nt_publishers[nt_key]
+        try:
+            self.destroy_publisher(pub)
+        except Exception:
+            pass
+        del self.nt_publishers[nt_key]
 
     def unregister_subscriber(self, nt_key: str) -> None:
         """
@@ -298,9 +294,9 @@ class ROSNetworkTablesBridge:
 
         :param nt_key: NetworkTables entry key that points to a subscriber
         """
-        rospy.loginfo(f"Unregistering subscribe topic {nt_key}")
+        self.get_logger().info(f"Unregistering subscribe topic {nt_key}")
         if nt_key not in self.subscribers:
-            rospy.logwarn(f"Can't remove subscriber {nt_key} as it's already removed.")
+            self.get_logger().warn(f"Can't remove subscriber {nt_key} as it's already removed.")
             return
         self.subscribers[nt_key].unregister()
         del self.subscribers[nt_key]
@@ -317,7 +313,7 @@ class ROSNetworkTablesBridge:
         """
         Comparing local NetworkTables keys and remote NetworkTables keys, get the keys that were removed
 
-        :return: Set of revmoed keys
+        :return: Set of removed keys
         """
         return local_keys.difference(remote_keys)
 
@@ -341,19 +337,15 @@ class ROSNetworkTablesBridge:
         :param topic_name: absolute or relative topic
         :return: absolute topic
         """
-        if topic_name[0] == "/":
+        if topic_name.startswith("/"):
             return topic_name
-        else:
-            return self.namespace + topic_name
+        return ns + topic_name
 
     def wait_for_non_empty(self, entry: NetworkTableEntry) -> str:
-        start_time = rospy.Time.now()
+        start_time = time.time()
         value = ""
         while len(value) == 0:
-            if (
-                rospy.is_shutdown()
-                or rospy.Time.now() - start_time > self.publisher_non_empty_timeout
-            ):
+            if (not rclpy.ok()) or (time.time() - start_time > self.publisher_non_empty_timeout):
                 return ""
             value = entry.getString("")
         return value
@@ -369,14 +361,10 @@ class ROSNetworkTablesBridge:
 
             # forcefully call the callback since this is the first update
             new_pub_entry = self.nt_to_ros_subtable.getEntry(new_pub_key)
-            self.nt_to_ros_callback(
-                new_pub_entry, new_pub_key, self.wait_for_non_empty(new_pub_entry), True
-            )
+            self.nt_to_ros_callback(new_pub_entry, new_pub_key, self.wait_for_non_empty(new_pub_entry), True)
 
             # create an entry listener for the new topic.
-            handle = new_pub_entry.addListener(
-                self.nt_to_ros_callback, NotifyFlags.UPDATE
-            )
+            handle = new_pub_entry.addListener(self.nt_to_ros_callback, NotifyFlags.UPDATE)
             self.pub_listen_handles[new_pub_key] = handle
 
     def check_removed_pub_keys(self, removed_pub_keys: Set[str]) -> None:
@@ -418,64 +406,73 @@ class ROSNetworkTablesBridge:
 
             self.unregister_subscriber(removed_sub_key)
 
-    def run(self):
+    def _on_timer(self):
         """
         Main loop of the ROSNetworkTablesBridge. Continuously checks for new NetworkTables keys to create
         publishers and subscribers.
         """
-        # create rate limiter object
-        rate = rospy.Rate(1.0 / self.update_interval)
+        # push local time to NT
+        self.update_time_sync()
 
-        # wait for NT entries to populate
-        rospy.sleep(self.nt_warmup_time)
-        self.start_time = rospy.Time.now()
+        if self.has_entries():
+            self.no_entries_timer = self.now()
+        else:
+            if self.now() - self.no_entries_timer > self.no_data_timeout:
+                self.get_logger().error(f"No data received for {self.no_data_timeout} seconds. Exiting.")
+                rclpy.shutdown()
+                sys.exit(1)
 
-        no_entries_timer = rospy.Time.now()
+        # get new publisher topics requested by the NT client
+        pub_topic_requests = self.get_topic_requests(self.nt_to_ros_topic_requests_table)
+        new_pub_keys = self.get_new_keys(self.pub_listen_keys, pub_topic_requests)
+        self.check_new_pub_keys(new_pub_keys)
 
-        # run until ROS signals to exit
-        while not rospy.is_shutdown():
-            # sleep by the specified rate
-            rate.sleep()
+        # get removed publisher topics requested by the NT client
+        removed_pub_keys = self.get_removed_keys(self.pub_listen_keys, pub_topic_requests)
+        self.check_removed_pub_keys(removed_pub_keys)
 
-            # push local time to NT
-            self.update_time_sync()
+        # get new subscriber topics requested by the NT client
+        sub_topic_requests = self.get_topic_requests(self.ros_to_nt_topic_requests_table)
+        new_sub_keys = self.get_new_keys(self.sub_listen_keys, sub_topic_requests)
+        self.check_new_sub_keys(new_sub_keys)
 
-            if self.has_entries():
-                no_entries_timer = rospy.Time.now()
-            else:
-                if rospy.Time.now() - no_entries_timer > self.no_data_timeout:
-                    rospy.logerr(
-                        f"No data received for {self.no_data_timeout.to_sec()} seconds. Exiting."
-                    )
-                    sys.exit(1)
+        # get removed subscriber topics requested by the NT client
+        removed_sub_keys = self.get_removed_keys(self.sub_listen_keys, sub_topic_requests)
+        self.check_removed_sub_keys(removed_sub_keys)
 
-            # get new publisher topics requested by the NT client
-            pub_topic_requests = self.get_topic_requests(
-                self.nt_to_ros_topic_requests_table
-            )
-            new_pub_keys = self.get_new_keys(self.pub_listen_keys, pub_topic_requests)
-            self.check_new_pub_keys(new_pub_keys)
+    def run(self):
+        # wait for NT entries to populate and then initialize timers (rate limit)
+        time.sleep(self.nt_warmup_time)
+        self.start_time = self.now()
 
-            # get removed publisher topics requested by the NT client
-            removed_pub_keys = self.get_removed_keys(
-                self.pub_listen_keys, pub_topic_requests
-            )
-            self.check_removed_pub_keys(removed_pub_keys)
+        # initialize no entries timer
+        self.no_entries_timer = self.now()
 
-            # get new subscriber topics requested by the NT client
-            sub_topic_requests = self.get_topic_requests(
-                self.ros_to_nt_topic_requests_table
-            )
-            new_sub_keys = self.get_new_keys(self.sub_listen_keys, sub_topic_requests)
-            self.check_new_sub_keys(new_sub_keys)
+        self._timer = self.create_timer(self.update_interval, self._on_timer)
 
-            # get removed subscriber topics requested by the NT client
-            removed_sub_keys = self.get_removed_keys(
-                self.sub_listen_keys, sub_topic_requests
-            )
-            self.check_removed_sub_keys(removed_sub_keys)
+        try:
+            rclpy.spin(self)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                self.destroy_node()
+            except Exception:
+                pass
+            rclpy.shutdown()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    bridge = ROSNetworkTablesBridge()
+    try:
+        bridge.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    bridge = ROSNetworkTablesBridge()
-    bridge.run()
+    main()

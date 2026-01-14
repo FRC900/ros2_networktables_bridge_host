@@ -2,6 +2,8 @@
 
 ros_networktables_bridge_host is a ROS package that bridges ROS (Robot Operating System) to the roboRIO using NetworkTables and JSON formatted NT entries. This project aims to provide a seamless integration between FRC (FIRST Robotics Competition) robots using WPILib and ROS, enabling advanced robot control, sensor integration, and autonomy. It's a cousin project to the Java client <https://github.com/frc-88/ROSNetworkTablesBridge>
 
+**This version has been converted to the appropriate ROS2 syntax but has not been thoroughly tested. Original ROS version created by FRC 88 (TJ^2).**
+
 # Features
 
 - Connects WPILib-based FRC robots with ROS using NetworkTables
@@ -10,7 +12,7 @@ ros_networktables_bridge_host is a ROS package that bridges ROS (Robot Operating
 
 # Prerequisites
 
-- ROS environment setup (tested with ROS Noetic)
+- ROS environment setup (tested with ROS Kilted)
 - rosbridge_library
 - pynetworktables version 2021.0.0
 
@@ -27,22 +29,13 @@ ros_networktables_bridge_host is a ROS package that bridges ROS (Robot Operating
 - Clone it into your workspace:
 
 ```bash
-git clone https://github.com/RobotWebTools/rosbridge_suite.git -b ros1
+git clone https://github.com/RobotWebTools/rosbridge_suite.git](https://github.com/FRC900/ros2_networktables_bridge_host.git
 ```
 
-- Clone into your catkin workspace:
+- Build and source:
 
 ```bash
-git clone https://github.com/frc-88/ros_networktables_bridge_host.git
-```
-
-- Rebuild the workspace: `catkin_make`
-
-## Python dependencies
-
-```bash
-cd path/to/ros_networktables_bridge_host
-pip3 install -r requirements.txt
+colcon build --symlink-install && source install/setup.bash
 ```
 
 # Example usage
@@ -50,17 +43,31 @@ pip3 install -r requirements.txt
 - Create a launch file:
 
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<launch>
-    <include file="$(find ros_networktables_bridge_host)/launch/nt_client.launch">
-        <arg name="nt_host" value="10.0.88.2"/>
-    </include>
-</launch>
+#!/usr/bin/env python3
+from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import AnyLaunchDescriptionSource
+from launch.substitutions import PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
+
+def generate_launch_description():
+    nt_client = IncludeLaunchDescription(
+        AnyLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare('ros_networktables_bridge_host'),
+                'launch',
+                'nt_client.launch.py'
+            ])
+        ),
+        launch_arguments={'nt_host': '10.0.88.2'}.items()
+    )
+
+    return LaunchDescription([nt_client])
 ```
 
 - This is an example where the team number is `88`
 
-- Launch the node: `roslaunch path/to/your/file.launch`
+- Launch the node: `ros2 launch path/to/your/file.launch.py`
 
 # Contributing
 

@@ -1,11 +1,10 @@
-## ! DO NOT MANUALLY INVOKE THIS setup.py, USE CATKIN INSTEAD
+from setuptools import setup, find_packages
 
-from setuptools import setup
-from catkin_pkg.python_setup import generate_distutils_setup
-
-# fetch values from package.xml
-setup_args = generate_distutils_setup(
-    packages=["ros_networktables_bridge_host"], package_dir={"": "src"}
+setup(
+    name='ros_networktables_bridge_host',
+    version='0.0.0',
+    packages=find_packages(exclude=('tests',)),
+    package_dir={'': '.'},
+    install_requires=['pynetworktables==2021.0.0'],
+    zip_safe=True,
 )
-
-setup(**setup_args)

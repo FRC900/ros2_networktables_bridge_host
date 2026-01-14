@@ -4,7 +4,7 @@
   <name>ros_networktables_bridge_host</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="woz4tetra@gmail.com">woz4tetra</maintainer>
+  <author email="woz4tetra@gmail.com">woz4tetra</author>
   <maintainer email="emmemcdonald66@gmail.com">giragon6</maintainer>
   <license>MIT</license>
 

@@ -1,20 +1,19 @@
-import rospy
 import json
 from importlib import import_module
-from rosbridge_library.internal import message_conversion
-from roslib.message import get_message_class
 
+from rosidl_runtime_py import message_to_ordereddict
+from rclpy_message_converter.message_converter import convert_ros_message_to_dictionary
 
 def ros_msg_to_msg_dict(msg):
-    msg_dict = message_conversion.extract_values(msg)
-    msg_dict["_type"] = getattr(msg, "_type", None)  # type: ignore
+    msg_dict = message_to_ordereddict(msg)
+    pkg = msg.__class__.__module__.split('.')[0]
+    msg_dict['_type'] = f"{pkg}/{msg.__class__.__name__}"
     return msg_dict
 
 
 def ros_msg_to_string_json(msg):
     msg_dict = ros_msg_to_msg_dict(msg)
-    msg_json = json.dumps(msg_dict)
-    return msg_json
+    return json.dumps(msg_dict)
 
 
 def string_json_to_msg_dict(msg_json: str):
@@ -26,16 +25,16 @@ def remove_type_fields(msg_dict: dict):
     for key in msg_dict.keys():
         if key == "_type":
             continue
-        elif type(msg_dict[key]) == dict:
+        elif isinstance(msg_dict[key], dict):
             new_dict[key] = remove_type_fields(msg_dict[key])
-        elif type(msg_dict[key]) == list:
+        elif isinstance(msg_dict[key], list):
             new_dict[key] = []
             if len(msg_dict[key]) > 0:
                 # ROS arrays are all the same type. Only check the first value if it has a _type field
                 first_value = msg_dict[key][0]
-                if type(first_value) == dict:
+                if isinstance(first_value, dict):
                     for value in msg_dict[key]:
-                        assert type(value) == dict, value
+                        assert isinstance(value, dict), value
                         new_dict[key].append(remove_type_fields(value))
                 else:
                     new_dict[key] = msg_dict[key]
@@ -46,27 +45,29 @@ def remove_type_fields(msg_dict: dict):
 
 def msg_dict_to_ros_type(msg_dict):
     if "_type" not in msg_dict:
-        rospy.logerr("JSON message must include a '_type' field.")
-        return None, None
+        raise ValueError("JSON message must include a '_type' field.")
 
     msg_type = msg_dict["_type"]
     msg_dict = remove_type_fields(msg_dict)
-    ros_msg_type = get_message_class(msg_type)
 
-    if ros_msg_type is None:
-        rospy.logerr("Invalid message type: %s", msg_type)
+    connection_header = msg_type.split('/')
+    pkg = connection_header[0]
+    msg_type_name = connection_header[-1]
+    ros_pkg = pkg + '.msg'
+
+    try:
+        msg_class = getattr(import_module(ros_pkg), msg_type_name)
+    except Exception:
         return None, None
 
-    return ros_msg_type, msg_dict
+    return msg_class, msg_dict
 
 
 def msg_dict_to_ros_msg(msg_dict, msg_cls):
     assert msg_cls is not None
-    msg = msg_cls()
-    message_conversion.populate_instance(msg_dict, msg)
-    return msg
+    return convert_ros_message_to_dictionary(msg_cls, msg_dict)
 
-
+     
 def string_json_to_ros_msg(string_json: str):
     if len(string_json) == 0:
         return None, None
@@ -79,18 +80,20 @@ def string_json_to_ros_msg(string_json: str):
 
 
 def parse_nt_topic(nt_ros_topic: str) -> str:
-    return nt_ros_topic.replace("\\", "/")
+    return nt_ros_topic.replace('\\', '/')
 
 
 def convert_to_nt_topic(ros_topic: str) -> str:
-    return ros_topic.replace("/", "\\")
+    return ros_topic.replace('/', '\\')
 
 
 def get_msg_class(cache, msg_type_name: str):
-    if msg_type_name not in cache:
-        connection_header = msg_type_name.split("/")
-        ros_pkg = connection_header[0] + ".msg"
-        msg_type = connection_header[1]
-        msg_class = getattr(import_module(ros_pkg), msg_type)
-        cache[msg_type_name] = msg_class
+    if msg_type_name in cache:
+        return cache[msg_type_name]
+    connection_header = msg_type_name.split('/')
+    pkg = connection_header[0]
+    msg_type = connection_header[-1]
+    ros_pkg = pkg + '.msg'
+    msg_class = getattr(import_module(ros_pkg), msg_type)
+    cache[msg_type_name] = msg_class
     return cache[msg_type_name]
